@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
@@ -244,6 +244,32 @@ pub fn status_to_exit_code(status: std::process::ExitStatus) -> i32 {
 // ISSUE #897: ChildGuard RAII prevents zombie processes that caused kernel panic
 pub const RAW_CAP: usize = 10_485_760; // 10 MiB
 
+/// Line reader that survives non-UTF-8 bytes.
+///
+/// `BufRead::lines()` yields an `Err` for a line that is not valid UTF-8, and
+/// `map_while(Result::ok)` then drops the *rest of the stream* — one stray byte
+/// (a binary match, a mixed-encoding file) silently truncates a tool's whole
+/// output. Replace lossily instead, matching what `.output()` capture does.
+fn lossy_lines(reader: impl Read) -> impl Iterator<Item = String> {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    std::iter::from_fn(move || {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => {
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
+        }
+    })
+}
+
 pub fn run_streaming(
     cmd: &mut Command,
     stdin_mode: StdinMode,
@@ -340,7 +366,7 @@ pub fn run_streaming(
         let (tx, rx) = mpsc::channel();
         let tx_out = tx.clone();
         let stdout_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            for line in lossy_lines(stdout) {
                 if tx_out.send(StreamLine::Stdout(line)).is_err() {
                     break;
                 }
@@ -348,7 +374,7 @@ pub fn run_streaming(
         });
         let tx_err = tx;
         let stderr_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            for line in lossy_lines(stderr) {
                 if tx_err.send(StreamLine::Stderr(line)).is_err() {
                     break;
                 }
@@ -417,7 +443,7 @@ pub fn run_streaming(
         let stderr_thread = std::thread::spawn(move || -> String {
             let mut raw_err = String::new();
             let mut capped = false;
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            for line in lossy_lines(stderr) {
                 if raw_err.len() + line.len() < RAW_CAP {
                     raw_err.push_str(&line);
                     raw_err.push('\n');
@@ -436,7 +462,7 @@ pub fn run_streaming(
                 FilterMode::Passthrough => unreachable!("handled by early-return above"),
                 FilterMode::Streaming(_) => unreachable!("handled by is_streaming branch"),
                 FilterMode::Buffered(filter_fn) => {
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    for line in lossy_lines(stdout) {
                         if raw_stdout.len() + line.len() < RAW_CAP {
                             raw_stdout.push_str(&line);
                             raw_stdout.push('\n');
@@ -461,7 +487,7 @@ pub fn run_streaming(
                     }
                 }
                 FilterMode::CaptureOnly => {
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    for line in lossy_lines(stdout) {
                         if raw_stdout.len() + line.len() < RAW_CAP {
                             raw_stdout.push_str(&line);
                             raw_stdout.push('\n');
